@@ -1,48 +1,70 @@
 import re
+from textwrap import dedent
 from typing import Any, Callable
 
-from pydantic import validate_arguments
+from cursive.compat.pydantic import BaseModel, validate_arguments
 
-from cursive.utils import trim
 
-class CursiveFunction:
-    def __init__(self, function: Callable, pause=False):
-        validate = validate_arguments(function)
-        self.parameters = validate.model.schema()
-        self.description = trim(function.__doc__)
-        self.pause = pause
+class CursiveCustomFunction(BaseModel):
+    definition: Callable
+    description: str = ""
+    function_schema: dict[str, Any]
+    pause: bool = False
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class CursiveFunction(CursiveCustomFunction):
+    def __setup__(self, function: Callable):
+        definition = function
+        description = dedent(function.__doc__ or "").strip()
+        parameters = validate_arguments(function).model.schema()
+
 
         # Delete ['v__duplicate_kwargs', 'args', 'kwargs'] from parameters
-        for k in ['v__duplicate_kwargs', 'args', 'kwargs']:
-            if k in self.parameters['properties']:
-                del self.parameters['properties'][k]
+        for k in ["v__duplicate_kwargs", "args", "kwargs"]:
+            if k in parameters["properties"]:
+                del parameters["properties"][k]
 
-
-        for k, v in self.parameters['properties'].items():
+        for k, v in parameters["properties"].items():
             # Find the parameter description in the docstring
-            match = re.search(rf'{k}: (.*)', self.description)
+            match = re.search(rf"{k}: (.*)", description)
             if match:
-                v['description'] = match.group(1)
+                v["description"] = match.group(1)
 
         schema = {}
-        if self.parameters:
-            schema = self.parameters
+        if parameters:
+            schema = parameters
+
+        properties = schema.get("properties") or {}
+        definitions = schema.get("definitions") or {}
+        resolved_properties = remove_key_deep(resolve_ref(properties, definitions), "title")
         
-        self.function_schema = {
-            'parameters': {
-                'type': schema.get('type'),
-                'properties': schema.get('properties') or {},
-                'required': schema.get('required') or [],
+
+        function_schema = {
+            "parameters": {
+                "type": schema.get("type"),
+                "properties": resolved_properties,
+                "required": schema.get("required") or [],
             },
-            'description': self.description,
-            'name': self.parameters['title'],
+            "description": description,
+            "name": parameters["title"],
         }
 
-        self.definition = function
+        return {
+            "definition": definition,
+            "description": description,
+            "function_schema": function_schema,
+        }
 
-    def __call__(self, *args: Any):
+    def __init__(self, function: Callable, pause=False):
+        setup = self.__setup__(function)
+        super().__init__(**setup, pause=pause)
+
+    def __call__(self, *args, **kwargs):
         # Validate arguments and parse them
-        return self.function(*args)
+        return self.definition(*args, **kwargs)
 
 
 def cursive_function(pause=False):
@@ -51,4 +73,51 @@ def cursive_function(pause=False):
             return lambda function: CursiveFunction(function, pause=pause)
         else:
             return CursiveFunction(function, pause=pause)
+
     return decorator
+
+def resolve_ref(data, definitions):
+    """
+    Recursively checks for a $ref key in a dictionary and replaces it with an entry in the definitions
+    dictionary, changing the key `$ref` to `type`.
+
+    Args:
+        data (dict): The data dictionary to check for $ref keys.
+        definitions (dict): The definitions dictionary to replace $ref keys with.
+
+    Returns:
+        dict: The data dictionary with $ref keys replaced.
+    """
+    if isinstance(data, dict):
+        if "$ref" in data:
+            ref = data["$ref"].split('/')[-1]
+            if ref in definitions:
+                definition = definitions[ref]
+                data = definition
+        else:
+            for key, value in data.items():
+                data[key] = resolve_ref(value, definitions)
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            data[index] = resolve_ref(value, definitions)
+    return data
+
+def remove_key_deep(data, key):
+    """
+    Recursively removes a key from a dictionary.
+
+    Args:
+        data (dict): The data dictionary to remove the key from.
+        key (str): The key to remove from the dictionary.
+
+    Returns:
+        dict: The data dictionary with the key removed.
+    """
+    if isinstance(data, dict):
+        data.pop(key, None)
+        for k, v in data.items():
+            data[k] = remove_key_deep(v, key)
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            data[index] = remove_key_deep(value, key)
+    return data
